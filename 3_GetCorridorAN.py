@@ -1,9 +1,6 @@
 import numpy as np
 import networkx as nx
 from osgeo import gdal, osr
-import matplotlib.pyplot as plt
-from scipy.sparse.csgraph import dijkstra
-from scipy.ndimage import label
 from tqdm import tqdm
 from scipy.spatial import distance
 import geopandas as gpd
@@ -47,6 +44,11 @@ def GeoImgW(filename,im_data, im_geotrans, im_porj,nodata, driver='GTiff'):
     del dataset
 
 def extract_subgrid(grid, point1, point2):
+    """
+    Extract the subgrid with the minimum external range.
+    grid: original grid data, NumPy array.
+    point1, point2: coordinates of two points (x, y).
+    """
     x1, y1 = point1
     x2, y2 = point2
 
@@ -66,6 +68,11 @@ def extract_subgrid(grid, point1, point2):
 
 
 def extract_centerP(grid, point1, point2):
+    """
+    Extract the subgrid with the minimum external range.
+    grid: original grid data, NumPy array.
+    point1, point2: coordinates of two points (x, y).
+    """
     x1, y1 = point1
     x2, y2 = point2
 
@@ -90,11 +97,22 @@ def extract_centerP(grid, point1, point2):
     return subgrid1, subgrid2 , subgrid_origin
 
 def restore_path_to_global(subgrid_origin, path):
+    """
+    Restore the subgrid path coordinates to the original grid coordinates.
+    subgrid_origin: The starting coordinates (x, y) of the subgrid in the original grid.
+    path: A list of path coordinates in the subgrid [(x1, y1), (x2, y2), ...].
+    """
     origin_x, origin_y = subgrid_origin
     global_path = [(x + origin_x, y + origin_y) for x, y in path]
     return global_path
 
 def restore_subgrid_to_original(grid, subgrid, subgrid_origin):
+    """
+    Restore subgrid data to the original grid.
+    grid: original grid data, NumPy array.
+    subgrid: subgrid data, NumPy array.
+    subgrid_origin: starting coordinates (x, y) of the subgrid in the original grid.
+    """
     origin_x, origin_y = subgrid_origin
     subgrid_rows, subgrid_cols = subgrid.shape
 
@@ -245,7 +263,7 @@ def geodataframes_to_graph(points_gdf, lines_gdf):
             G.add_edge(start_node, end_node, **edge_attributes)
     return G
 
-def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resistance_raster,adjacency_df):
+def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resistance_raster, adjacency_df):
     unique_nodes = np.unique(node_raster[~np.isnan(node_raster) & (node_raster > 0)])
 
     dataset = gdal.Open(node_raster_path)
@@ -268,7 +286,6 @@ def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resi
         node_positions[node] = pos
         point_geometry_list.append((lon,lat))
         point_attribute_list.append({"nodeid": node,"sourceid": node ,"type":'S'})
-    # line_positions = {label: np.argwhere(line_raster == label) for label in unique_nodes}
     
     nique_values_block = adjacency_df['Block'].unique()
     G1nodeId = len(node_positions)
@@ -292,10 +309,10 @@ def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resi
             subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
             path = restore_path_to_global(source_origin, subpath)
 
-            if path == []:
+            if len(path) <= 1:
                 eightConn.append(str(node_i) + "--" +str(node_j))
                 continue
-
+            
             updataMask = np.zeros(core_raster.shape)
             updataMask[np.where((core_raster!=0)&(core_raster!=node_i)&(core_raster!=node_j))] = 1
             maskIndex = np.array([updataMask[p[0], p[1]] for p in path])
@@ -348,32 +365,30 @@ def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resi
                 cost_dist, direction = cost_distance_with_direction(source_rassub, connectivity_sub, True)
                 subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
                 path1 = restore_path_to_global(source_origin, subpath)
-                # path = dijkstra(connectivity_weight_core_raster, node_positions[node_i], pi_light)
-                # _, path = nx.single_source_dijkstra(weightgraph, source=tuple(node_positions[node_i]), target=tuple(pi_light), weight='weight')
-                geopath = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path1]
-                line_geom = LineString(geopath)
-                geometry_list.append(line_geom)
-                pathList = [connectivity_raster[p[0], p[1]] for p in path1]
-                mean_weight = np.mean(pathList)
-                sum_weight = np.sum(pathList)
-                lenc = len(path)
-                attribute_list.append({"fromnode": node_i,"tonode":node_i,"fromX": fromPointS[0], "fromY": fromPointS[1], "toX": fromPoint[0], "toY": fromPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Li})
-                G1.add_edge(node_i, actId_pi, weight=mean_weight, sum_weight=sum_weight, distance = min_len,fromx = fromPointS[0], fromy = fromPointS[1], tox = fromPoint[0], toy =fromPoint[1], lineid = lineId_Li)
+                geopath1 = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path1]
+                if len(geopath1) > 1:
+                    line_geom = LineString(geopath1)
+                    geometry_list.append(line_geom)
+                    pathList = [connectivity_raster[p[0], p[1]] for p in path1]
+                    mean_weight = np.mean(pathList)
+                    sum_weight = np.sum(pathList)
+                    lenc = len(path)
+                    attribute_list.append({"fromnode": node_i,"tonode":node_i,"fromX": fromPointS[0], "fromY": fromPointS[1], "toX": fromPoint[0], "toY": fromPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Li})
 
                 source_rassub, target_rassub, source_origin = extract_centerP(source_ras, node_positions[node_j], path[-1])
                 connectivity_sub, _ = extract_subgrid(resistance_raster, node_positions[node_j], path[-1])
                 cost_dist, direction = cost_distance_with_direction(source_rassub, connectivity_sub, True)
                 subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
                 path2 = restore_path_to_global(source_origin, subpath)
-                geopath = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path2]
-                line_geom = LineString(geopath)
-                geometry_list.append(line_geom)
-                pathList = [connectivity_raster[p[0], p[1]] for p in path2]
-                mean_weight = np.mean(pathList)
-                sum_weight = np.sum(pathList)
-                lenc = len(path)
-                attribute_list.append({"fromnode": node_j,"tonode":node_j,"fromX": toPointS[0], "fromY": toPointS[1], "toX": toPoint[0], "toY": toPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Lj})
-                G1.add_edge(node_j, actId_pj, weight=mean_weight, sum_weight=sum_weight, distance = min_len,fromx = toPointS[0], fromy = toPointS[1], tox = toPoint[0], toy =toPoint[1], lineid = lineId_Lj)
+                geopath2 = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path2]
+                if len(geopath2) > 1:
+                    line_geom = LineString(geopath2)
+                    geometry_list.append(line_geom)
+                    pathList = [connectivity_raster[p[0], p[1]] for p in path2]
+                    mean_weight = np.mean(pathList)
+                    sum_weight = np.sum(pathList)
+                    lenc = len(path)
+                    attribute_list.append({"fromnode": node_j,"tonode":node_j,"fromX": toPointS[0], "fromY": toPointS[1], "toX": toPoint[0], "toY": toPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Lj})
 
     # 保存踏脚石之间的廊道数据为Shp数据
     gdf = gpd.GeoDataFrame(attribute_list, crs="EPSG:4326", geometry=geometry_list)
@@ -389,18 +404,15 @@ def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resi
     gdfpoint_unique = gdfpoint.loc[gdfpoint.groupby('wkb_geometry')['nodeid'].idxmin()]
     gdfpoint_unique = gdfpoint_unique.drop(columns='wkb_geometry')
 
-    G2 = geodataframes_to_graph(gdfpoint_unique, gdf_unique)
-
-    return G, G2 , gdf_unique, gdfpoint_unique
+    G_act = geodataframes_to_graph(gdfpoint_unique, gdf_unique)
+    return G, G_act , gdf_unique, gdfpoint_unique
 
 def save_graph_to_graphml(graph, file_path):
     nx.write_graphml(graph, file_path)
 
 
 if __name__ == '__main__':
-
     # node_raster_path景观源点数据路径；mspa_core_path景观Core区数据；
-    # line_raster_path景观边缘数据（目的是减少计算，数据量不大时可以与mspa_core_path一致）
     node_raster_path = r'InputData\mspa_core_filled_center.tif'
     mspa_core_path = r'InputData\mspa_core_filled.tif'
     node_raster,im_porj, im_geotrans = GeoImgR(node_raster_path)
@@ -416,10 +428,10 @@ if __name__ == '__main__':
     adjacency_df = read_adjacency_csv(adj_csv_path)
 
     # 输出文件路径
-    graphml_file_path = r'OutputData/ecological_network0812_mcr.graphml'
-    graphml_file_path1 = r'OutputData/ecological_network0812_mcr_act.graphml'
-    shpline_file_path = r'OutputData/ecological_network0812_mcr.shp'
-    shppoint_file_path = r'OutputData/ecological_network0812_mcr_point.shp'
+    graphml_file_path = r'OutputData/ecological_network1111_mcr.graphml'
+    graphml_act_file_path = r'OutputData/ecological_network1111_mcr_act.graphml'
+    shpline_file_path = r'OutputData/ecological_network1111_mcr.shp'
+    shppoint_file_path = r'OutputData/ecological_network1111_mcr_point.shp'
 
     # ****************************************************************创建生态网络
     eightConn = []
@@ -427,9 +439,9 @@ if __name__ == '__main__':
     print(eightConn)
 
     # 保存图结构到GraphML文件
-    save_graph_to_graphml(ecological_network, graphml_file_path)
-    save_graph_to_graphml(ecological_network_act, graphml_file_path1)
+    save_graph_to_graphml(ecological_network, graphml_file_path)  #仅仅包括生态源点的网络
+    save_graph_to_graphml(ecological_network_act, graphml_act_file_path)  #包括激活点的网络
     corrdors.to_file(shpline_file_path)
     point.to_file(shppoint_file_path)
 
-    # screen -L -Logfile getcorridor_mcr0804.log python 3_GetCorridor.py
+    # screen -L -Logfile getcorridor_mcr1107_300.log python 3_GetCorridorAN.py
