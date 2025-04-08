@@ -15,3 +15,8 @@ ELT-Direction.py implements corridor direction computation, classifying corridor
 ELT-BiologicalFlow.py enables the computation of dynamic biological flows, where potential biological flows arise from species migration between habitat patches, influenced by habitat area, biodiversity, and habitat quality (Lu et al., 2024). Drawing on island biogeography theory, large-scale species habitats can serve as "species pools" for surrounding habitats (MacArthur and Wilson, 1963).
 
 ![image](https://github.com/HaoweiGis/Ecological-Linkage-Tool/blob/main/InputData/Framework2.JPG)
+
+##  Contact Information
+If you have any query for this work, please directly contact me.
+E-mail: haoweimu@smail.nju.edu.cn
+WeChat: HaoweiNJU
