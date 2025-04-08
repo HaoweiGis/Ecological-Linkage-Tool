@@ -18,5 +18,7 @@ ELT-BiologicalFlow.py enables the computation of dynamic biological flows, where
 
 ##  Contact Information
 If you have any query for this work, please directly contact me.
+
 E-mail: haoweimu@smail.nju.edu.cn
+
 WeChat: HaoweiNJU
