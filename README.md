@@ -13,5 +13,3 @@ The article submitted to Geography and Sustainability
 ELT-Direction.py implements corridor direction computation, classifying corridors into east-west, north-south, southeast-northwest, and northeast-southwest directions based on their average azimuth angles. These calculations are performed in a projected coordinate system using the Albers equal-area conic projection, which is well-suited for mid-latitude regions.
 
 ELT-BiologicalFlow.py enables the computation of dynamic biological flows, where potential biological flows arise from species migration between habitat patches, influenced by habitat area, biodiversity, and habitat quality (Lu et al., 2024). Drawing on island biogeography theory, large-scale species habitats can serve as "species pools" for surrounding habitats (MacArthur and Wilson, 1963).
-
-Lu, Y., Huang, D., Tong, Z., Liu, Y., He, J., Liu, Y., 2024, A conceptual framework for constructing and evaluating directed ecological networks: Evidence from Wuhan Metropolitan Area, China, Environmental Impact Assessment Review 106:107464.
