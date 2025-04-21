@@ -8,7 +8,6 @@ The Ecological Linkage Tool (ELT) can identify ecological corridors both within 
 ELT comprises three key codes: 1_AdjacentCore.py, 2_GetActivateP.py, and 3_GetCorridorAN.py. 
 
 ![image](https://github.com/HaoweiGis/Ecological-Linkage-Tool/blob/main/InputData/Framework.jpg)
-The article submitted to Geography and Sustainability
 
 ELT-Direction.py implements corridor direction computation, classifying corridors into east-west, north-south, southeast-northwest, and northeast-southwest directions based on their average azimuth angles. These calculations are performed in a projected coordinate system using the Albers equal-area conic projection, which is well-suited for mid-latitude regions.
 
