@@ -1,10 +1,13 @@
+# 执行时间记录（geobase；InputData -> OutputData；2026-04-16）
+# 本脚本：26.56 s（19 线程）
+
 import numpy as np
-from osgeo import gdal, osr
+from osgeo import gdal
 from tqdm import tqdm
 import pandas as pd
-from scipy.spatial import distance
+from scipy.spatial.distance import cdist
 from scipy.ndimage import binary_erosion
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor
 
 def GeoImgR(filename):
     dataset = gdal.Open(filename)
@@ -12,144 +15,94 @@ def GeoImgR(filename):
     im_geotrans = dataset.GetGeoTransform()
     im_data = np.array(dataset.ReadAsArray())
     nodata_value = dataset.GetRasterBand(1).GetNoDataValue()
-    if len(im_data.shape) == 2:
+    if im_data.ndim == 2:
         im_data = im_data[np.newaxis, :, :]
     del dataset
     return im_data, im_porj, im_geotrans, nodata_value
 
-def GeoImgW(filename, im_data, im_geotrans, im_porj, nodata, driver='GTiff'):
-    im_shape = im_data.shape
-    driver = gdal.GetDriverByName(driver)
-    datetype = gdal.GDT_UInt32
-    dataset = driver.Create(filename, im_shape[2], im_shape[1], im_shape[0], datetype,
-                            options=["TILED=YES", "COMPRESS=LZW"])
-    dataset.SetGeoTransform(im_geotrans)
-    dataset.SetProjection(im_porj)
-    for band_num in range(im_shape[0]):
-        img = im_data[band_num, :, :]
-        raster_band = dataset.GetRasterBand(band_num + 1)
-        raster_band.SetNoDataValue(nodata)
-        raster_band.WriteArray(img)
-    del dataset
-
-# 获取边界像素
-def get_internal_boundaries(raster, nodata_value):
+def get_internal_boundaries(raster, nodata_value=0):
     unique_labels = np.unique(raster)
-    boundaries = np.zeros_like(raster)
-    structure = np.ones((3, 3), dtype=int)
+    boundaries = np.zeros_like(raster, dtype=np.int32)
+    struct = np.ones((3, 3), dtype=bool)
     for label in unique_labels:
         if label == nodata_value:
             continue
         patch = (raster == label)
-        eroded_patch = binary_erosion(patch, structure)
+        eroded_patch = binary_erosion(patch, structure=struct)
         boundary = patch & ~eroded_patch
-        boundaries[boundary] = label
+        boundaries[boundary] = int(label)
     return boundaries
 
-# 读取邻接关系
-def read_adjacency_csv(csv_path):
-    return pd.read_csv(csv_path)
+def _nearest_pair_for_row(row, boundary_positions):
+    b1 = int(row.Block)
+    b2 = int(row.Adjacent)
+    p1 = boundary_positions.get(b1)
+    p2 = boundary_positions.get(b2)
+    if p1 is None or len(p1) == 0 or p2 is None or len(p2) == 0:
+        return None
+    dists = cdist(p1, p2)
+    idx = np.unravel_index(np.argmin(dists), dists.shape)
+    return {
+        'Block': b1,
+        'Adjacent': b2,
+        'NearestP_Block1_X': int(p1[idx[0]][0]),
+        'NearestP_Block1_Y': int(p1[idx[0]][1]),
+        'NearestP_Block2_X': int(p2[idx[1]][0]),
+        'NearestP_Block2_Y': int(p2[idx[1]][1]),
+        'Distance': float(dists[idx]),
+    }
 
-# ******************************************************************Single thread
-# 获取相邻斑块之间的最近点
-def get_near_points_single(boundary_raster, adjacency_df):
+
+def find_nearest_pairs(boundary_raster, adjacency_df, n_workers=1):
     unique_labels = np.unique(boundary_raster)
     unique_labels = unique_labels[unique_labels != 0]
-    
-    boundary_positions = {label: np.argwhere(boundary_raster == label) for label in unique_labels}
-    
-    new_raster = np.zeros(boundary_raster.shape, dtype=np.uint32)
-    nearest_pairs = []
-    
-    for _, row in tqdm(adjacency_df.iterrows(), total=len(adjacency_df), desc="Processing Rows"):
-        block1 = row['Block']
-        block2 = row['Adjacent']
-        pixels1 = boundary_positions.get(block1, [])
-        pixels2 = boundary_positions.get(block2, [])
-        
-        # 使用 scipy.spatial.distance.cdist 加速计算距离矩阵
-        dists = distance.cdist(pixels1, pixels2)
-        min_idx = np.unravel_index(np.argmin(dists), dists.shape)
-        min_dist = dists[min_idx]
+    boundary_positions = {
+        int(lbl): np.argwhere(boundary_raster == lbl)
+        for lbl in unique_labels
+    }
+    rows = list(adjacency_df.itertuples(index=False))
+    if n_workers is None or n_workers < 2:
+        records = []
+        for row in tqdm(rows, total=len(rows), desc="最近点对"):
+            rec = _nearest_pair_for_row(row, boundary_positions)
+            if rec is not None:
+                records.append(rec)
+        return pd.DataFrame(records)
 
-        nearest_pair = (tuple(pixels1[min_idx[0]]), tuple(pixels2[min_idx[1]]))
-        nearest_pairs.append((block1, block2, nearest_pair[0][0], nearest_pair[0][1], nearest_pair[1][0], nearest_pair[1][1], min_dist))
-        
-        if nearest_pair[0] and nearest_pair[1]:
-            new_raster[nearest_pair[0]] = block1
-            new_raster[nearest_pair[1]] = block2
-    
-    # 将最近点对添加到 adjacency_df
-    nearest_pairs_df = pd.DataFrame(nearest_pairs, columns=['Block', 'Adjacent', 'NearestP_Block1_X','NearestP_Block1_Y', 'NearestP_Block2_X', 'NearestP_Block2_Y', 'Distance'])
-    adjacency_df = pd.concat([adjacency_df, nearest_pairs_df[['NearestP_Block1_X','NearestP_Block1_Y', 'NearestP_Block2_X', 'NearestP_Block2_Y', 'Distance']]], axis=1)
-
-    return new_raster,adjacency_df
-
-# ******************************************************************Parallel
-def process_row(args):
-    index, row, boundary_positions = args
-    block1 = row['Block']
-    block2 = row['Adjacent']
-    pixels1 = boundary_positions.get(block1, [])
-    pixels2 = boundary_positions.get(block2, [])
-    
-    # if len(pixels1) == 0 or len(pixels2) == 0:
-    #     return index, None  # 跳过没有像素的块
-    
-    dists = distance.cdist(pixels1, pixels2)
-    min_idx = np.unravel_index(np.argmin(dists), dists.shape)
-    min_dist = dists[min_idx]
-
-    nearest_pair = (tuple(pixels1[min_idx[0]]), tuple(pixels2[min_idx[1]]))
-    return index, (block1, block2, nearest_pair[0][0], nearest_pair[0][1], nearest_pair[1][0], nearest_pair[1][1], min_dist)
-
-def get_near_points_parallel(boundary_raster, adjacency_df):
-    unique_labels = np.unique(boundary_raster)
-    unique_labels = unique_labels[unique_labels != 0]
-    
-    boundary_positions = {label: np.argwhere(boundary_raster == label) for label in unique_labels}
-    
-    new_raster = np.zeros(boundary_raster.shape, dtype=np.uint32)
-
-    # 设置并行处理
-    num_workers = cpu_count()
-    with Pool(num_workers) as pool:
-        args = ((index, row, boundary_positions) for index, row in adjacency_df.iterrows())
-        results = list(tqdm(pool.imap(process_row, args), total=len(adjacency_df), desc="Processing Rows"))
-
-    nearest_pairs = [(index, pair) for index, pair in results if pair is not None]  # 移除 None 值
-    
-    # 确保最近点对和原始数据对应
-    nearest_pairs_df = pd.DataFrame([pair for index, pair in nearest_pairs], 
-                                    columns=['Block', 'Adjacent', 'NearestP_Block1_X','NearestP_Block1_Y', 'NearestP_Block2_X', 'NearestP_Block2_Y', 'Distance'],
-                                    index=[index for index, pair in nearest_pairs])
-
-    # 更新 new_raster
-    for _, pair in nearest_pairs:
-        block1, block2, x1, y1, x2, y2, min_dist = pair
-        new_raster[x1, y1] = block1
-        new_raster[x2, y2] = block2
-
-    return new_raster, nearest_pairs_df
-
+    records = []
+    with ThreadPoolExecutor(max_workers=int(n_workers)) as executor:
+        for rec in tqdm(
+            executor.map(lambda r: _nearest_pair_for_row(r, boundary_positions), rows),
+            total=len(rows),
+            desc=f"最近点对（{int(n_workers)}线程）",
+        ):
+            if rec is not None:
+                records.append(rec)
+    return pd.DataFrame(records)
 
 if __name__ == '__main__':
-    # GeoTIFF文件路径
-    input_raster_path = r'InputData\mspa_core_filled.tif'
-    adj_csv_path =r'OutputData/adjacency_parallel.csv'
-    actP_raster_path = r'OutputData/mspa_core_activate_parallel.tif'
+    import os
 
+    base_dir = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    output_dir = os.path.join(base_dir, 'OutputData')
+    os.makedirs(output_dir, exist_ok=True)
+
+    input_raster_path = os.path.join(output_dir, 'mspa_core_filled.tif')
+    adj_csv_path      = os.path.join(output_dir, 'adjacency_parallel.csv')
+
+    print("读取源地栅格...")
     line_raster, im_porj, im_geotrans, nodata_value = GeoImgR(input_raster_path)
+
+    print("提取边界像素...")
     boundary_raster = get_internal_boundaries(line_raster[0], nodata_value)
-    adjacency_df = read_adjacency_csv(adj_csv_path)
 
-    # 选择是否并行
-    new_raster,adjacency_df = get_near_points_single(boundary_raster, adjacency_df)
-    # new_raster,adjacency_df = get_near_points_parallel(boundary_raster, adjacency_df)
-    adjacency_df.to_csv(adj_csv_path, index=False)
+    print("读取邻接关系...")
+    adjacency_df = pd.read_csv(adj_csv_path)
 
-    GeoImgW(actP_raster_path, new_raster[np.newaxis, :, :], im_geotrans, im_porj, nodata=0, driver='GTiff')
-    print("ActivatePoints计算完成，结果已保存为栅格文件。")
+    print("计算邻接斑块间的最近点对...")
+    n_workers = max(1, (os.cpu_count() or 2) - 1)
+    result_df = find_nearest_pairs(boundary_raster, adjacency_df, n_workers=n_workers)
 
-    # screen -L -Logfile 2_adj_single.log python 2_GetActivatePoint.py
-    # screen -L -Logfile 2_adj_parallel.log python 2_GetActivatePoint.py
+    result_df.to_csv(adj_csv_path, index=False)
+    print(f"邻接+最近点已保存: {adj_csv_path}")
+    print(f"有效邻接对: {len(result_df)}")

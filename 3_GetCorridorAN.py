@@ -1,447 +1,520 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+生态廊道构建工具 - 基于最小累积阻力模型
+=========================================
+优化点：
+    - 坐标转换器缓存（避免每像素新建 SpatialReference）
+    - 阻力面 NaN 处理（Dijkstra 不可处理 NaN）
+    - 步骤 3 廊道构建多进程并行（每对邻接斑块独立计算）
+"""
+
+# 执行时间记录（geobase；InputData -> OutputData；2026-04-16；ELT_MAX_PAIRS=200）
+# 单进程（ELT_N_WORKERS=1）：649.85 s
+# 6 进程（ELT_N_WORKERS=6）：208.34 s（约 3.12x 加速）
+
 import numpy as np
 import networkx as nx
 from osgeo import gdal, osr
 from tqdm import tqdm
-from scipy.spatial import distance
 import geopandas as gpd
-from shapely.geometry import LineString
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 import pandas as pd
 import heapq
+import os
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+
+_transformer_cache = {}
+_CORE_RASTER = None
+_RESISTANCE_RASTER = None
+_CONNECTIVITY_RASTER = None
+_GT = None
+_PROJ_WKT = None
+
+
+def _init_worker(core_raster, resistance_raster, connectivity_raster, gt, proj_wkt):
+    global _CORE_RASTER, _RESISTANCE_RASTER, _CONNECTIVITY_RASTER, _GT, _PROJ_WKT
+    _CORE_RASTER = np.array(core_raster)
+    _RESISTANCE_RASTER = np.array(resistance_raster, dtype='float64')
+    _RESISTANCE_RASTER[_RESISTANCE_RASTER <= 0] = np.nan
+    _CONNECTIVITY_RASTER = np.array(connectivity_raster, dtype='float64')
+    _CONNECTIVITY_RASTER[_CONNECTIVITY_RASTER <= 0] = np.nan
+    _GT = gt
+    _PROJ_WKT = proj_wkt
+
+def _get_transformer(src_wkt):
+    if src_wkt not in _transformer_cache:
+        src = osr.SpatialReference()
+        src.ImportFromWkt(src_wkt)
+        dst = osr.SpatialReference()
+        dst.ImportFromEPSG(4326)
+        _transformer_cache[src_wkt] = osr.CoordinateTransformation(src, dst)
+    return _transformer_cache[src_wkt]
+
+def pixel_to_geo(dataset, col, row):
+    gt = dataset.GetGeoTransform()
+    px = gt[0] + col * gt[1] + row * gt[2]
+    py = gt[3] + col * gt[4] + row * gt[5]
+    transformer = _get_transformer(dataset.GetProjection())
+    lat, lon, _ = transformer.TransformPoint(px, py)
+    return lon, lat
+
+def pixel_to_geo_by_gt(gt, proj_wkt, col, row):
+    px = gt[0] + col * gt[1] + row * gt[2]
+    py = gt[3] + col * gt[4] + row * gt[5]
+    transformer = _get_transformer(proj_wkt)
+    lat, lon, _ = transformer.TransformPoint(px, py)
+    return lon, lat
 
 def GeoImgR(filename):
     dataset = gdal.Open(filename)
     im_data = np.array(dataset.ReadAsArray())
     im_porj = dataset.GetProjection()
     im_geotrans = dataset.GetGeoTransform()
-    del dataset
     return im_data, im_porj, im_geotrans
 
-def GeoImgW(filename,im_data, im_geotrans, im_porj,nodata, driver='GTiff'):
-    im_shape = im_data.shape
-    driver = gdal.GetDriverByName(driver)
-    if "int8" in im_data.dtype.name:
-        datetype = gdal.GDT_Byte
-    elif "int16" in im_data.dtype.name:
-        datetype = gdal.GDT_UInt16
-    elif "int32" in im_data.dtype.name:
-        datetype = gdal.GDT_UInt32
-    else :
-        datetype = gdal.GDT_Float32
-    # datetype = gdal.GDT_Byte
-    # driver.Create weight hight
-    dataset = driver.Create(filename, im_shape[2], im_shape[1], im_shape[0], datetype,
-    options=["TILED=YES", "COMPRESS={0}".format("LZW")])
-    dataset.SetGeoTransform(im_geotrans)
-    dataset.SetProjection(im_porj)
-    for band_num in range(im_shape[0]):
-        img = im_data[band_num,:,:]
-        band_num = band_num + 1
-        raster_band = dataset.GetRasterBand(band_num)
-        raster_band.SetNoDataValue(nodata)
-        # raster_band.SetDescription(bandNames[band_num-1])
-        raster_band.WriteArray(img)
-    del dataset
+def extract_subgrid(grid, p1, p2):
+    x1, y1 = p1
+    x2, y2 = p2
+    dist = int(np.ceil(np.sqrt((x1 - x2)**2 + (y1 - y2)**2)))
+    x_min = max(0, min(x1, x2) - dist)
+    x_max = min(grid.shape[0] - 1, max(x1, x2) + dist)
+    y_min = max(0, min(y1, y2) - dist)
+    y_max = min(grid.shape[1] - 1, max(y1, y2) + dist)
+    return grid[x_min:x_max+1, y_min:y_max+1], (x_min, y_min)
 
-def extract_subgrid(grid, point1, point2):
-    """
-    Extract the subgrid with the minimum external range.
-    grid: original grid data, NumPy array.
-    point1, point2: coordinates of two points (x, y).
-    """
-    x1, y1 = point1
-    x2, y2 = point2
+def extract_center_subgrid(p1, p2):
+    x1, y1 = p1
+    x2, y2 = p2
+    dist = int(np.ceil(np.sqrt((x1 - x2)**2 + (y1 - y2)**2)))
+    x_min = max(0, min(x1, x2) - dist)
+    x_max = x_min + 2 * dist
+    y_min = max(0, min(y1, y2) - dist)
+    y_max = y_min + 2 * dist
+    sub1 = np.zeros((2 * dist + 1, 2 * dist + 1))
+    sub2 = np.zeros((2 * dist + 1, 2 * dist + 1))
+    sub1[x1 - x_min, y1 - y_min] = 1
+    sub2[x2 - x_min, y2 - y_min] = 1
+    return sub1, sub2, (x_min, y_min)
 
-    # 计算两点之间的欧氏距离
-    euclidean_distance = int(np.ceil(distance.euclidean(point1, point2)))
+def restore_path(origin, path):
+    ox, oy = origin
+    return [(x + ox, y + oy) for x, y in path]
 
-    # 计算子栅格的边界
-    min_x = max(0, min(x1, x2) - euclidean_distance)
-    max_x = min(grid.shape[0] - 1, max(x1, x2) + euclidean_distance)
-    min_y = max(0, min(y1, y2) - euclidean_distance)
-    max_y = min(grid.shape[1] - 1, max(y1, y2) + euclidean_distance)
-
-    subgrid = grid[min_x:max_x + 1, min_y:max_y + 1]
-    subgrid_origin = (min_x, min_y)
-
-    return subgrid, subgrid_origin
-
-
-def extract_centerP(grid, point1, point2):
-    """
-    Extract the subgrid with the minimum external range.
-    grid: original grid data, NumPy array.
-    point1, point2: coordinates of two points (x, y).
-    """
-    x1, y1 = point1
-    x2, y2 = point2
-
-    # 计算两点之间的欧氏距离
-    euclidean_distance = int(np.ceil(distance.euclidean(point1, point2)))
-
-    # 计算子栅格的边界
-    min_x = max(0, min(x1, x2) - euclidean_distance)
-    max_x = min(grid.shape[0] - 1, max(x1, x2) + euclidean_distance)
-    min_y = max(0, min(y1, y2) - euclidean_distance)
-    max_y = min(grid.shape[1] - 1, max(y1, y2) + euclidean_distance)
-
-    subgrid = grid[min_x:max_x + 1, min_y:max_y + 1]
-    new_point1 = (point1[0] - min_x, point1[1] - min_y)
-    new_point2 = (point2[0] - min_x, point2[1] - min_y)
-    subgrid1 = np.zeros(subgrid.shape)
-    subgrid2 = np.zeros(subgrid.shape)
-    subgrid1[new_point1] = 1
-    subgrid2[new_point2] = 1
-    subgrid_origin = (min_x, min_y)
-
-    return subgrid1, subgrid2 , subgrid_origin
-
-def restore_path_to_global(subgrid_origin, path):
-    """
-    Restore the subgrid path coordinates to the original grid coordinates.
-    subgrid_origin: The starting coordinates (x, y) of the subgrid in the original grid.
-    path: A list of path coordinates in the subgrid [(x1, y1), (x2, y2), ...].
-    """
-    origin_x, origin_y = subgrid_origin
-    global_path = [(x + origin_x, y + origin_y) for x, y in path]
-    return global_path
-
-def restore_subgrid_to_original(grid, subgrid, subgrid_origin):
-    """
-    Restore subgrid data to the original grid.
-    grid: original grid data, NumPy array.
-    subgrid: subgrid data, NumPy array.
-    subgrid_origin: starting coordinates (x, y) of the subgrid in the original grid.
-    """
-    origin_x, origin_y = subgrid_origin
-    subgrid_rows, subgrid_cols = subgrid.shape
-
-    grid[origin_x:origin_x + subgrid_rows, origin_y:origin_y + subgrid_cols] = subgrid
-    return grid
-
-def pixel_to_geo(dataset, x, y):
-    transform = dataset.GetGeoTransform()
-    px = transform[0] + x * transform[1] + y * transform[2]
-    py = transform[3] + x * transform[4] + y * transform[5]
-
-    source = osr.SpatialReference()
-    source.ImportFromWkt(dataset.GetProjection())
-    target = osr.SpatialReference()
-    target.ImportFromEPSG(4326)  # WGS84
-    transform = osr.CoordinateTransformation(source, target)
-    lat, lon, _  = transform.TransformPoint(px, py)
-    return lon, lat
-
-def create_sparse_graph(connectivity_raster):
-    rows, cols = connectivity_raster.shape
-    graph = nx.DiGraph()
-    for i in range(rows):
-        for j in range(cols):
-            if not np.isnan(connectivity_raster[i, j]):
-                for ni, nj in [(i-1, j), (i+1, j), (i, j-1), (i, j+1)]:
-                    if 0 <= ni < rows and 0 <= nj < cols and not np.isnan(connectivity_raster[ni, nj]):
-                        graph.add_edge((i, j), (ni, nj), weight=connectivity_raster[ni, nj])
-    return graph
-
-def convert_to_int_tuple(np_tuple):
-    return tuple(map(int, np_tuple))
-
-# 读取邻接关系
-def read_adjacency_csv(csv_path):
-    return pd.read_csv(csv_path)
-
-def cost_distance_with_direction(source_ras, cost_ras, eight_directions=True):
+def cost_distance(src_ras, cost_ras, eight=True):
     rows, cols = cost_ras.shape
     cost_dist = np.full((rows, cols), np.inf)
-    direction = np.full((rows, cols), -1)
-    visited = np.zeros((rows, cols), dtype=bool)
-    
-    # Priority queue for Dijkstra algorithm
+    direction  = np.full((rows, cols), -1, dtype=np.int8)
+    visited    = np.zeros((rows, cols), dtype=bool)
     pq = []
-
-    # Initialize source points
     for r in range(rows):
         for c in range(cols):
-            if source_ras[r, c] > 0:
+            if src_ras[r, c] > 0:
                 cost_dist[r, c] = 0
-                heapq.heappush(pq, (0, r, c))
-    
-    # Dijkstra's algorithm
-    if eight_directions:
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-        direction_codes = [0, 1, 2, 3, 4, 5, 6, 7]  # Assigning direction codes for each move
-    else:
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        direction_codes = [0, 1, 2, 3]  # Assigning direction codes for each move
-    
+                heapq.heappush(pq, (0.0, r, c))
+    moves = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)] if eight else [(-1,0),(1,0),(0,-1),(0,1)]
+    codes = [0,1,2,3,4,5,6,7] if eight else [0,1,2,3]
     while pq:
-        current_cost, r, c = heapq.heappop(pq)
-        
+        cur, r, c = heapq.heappop(pq)
         if visited[r, c]:
             continue
-        
         visited[r, c] = True
-        
-        for i, (dr, dc) in enumerate(directions):
+        for i, (dr, dc) in enumerate(moves):
             nr, nc = r + dr, c + dc
-            
-            if 0 <= nr < rows and 0 <= nc < cols and not visited[nr, nc]:
-                move_cost = cost_ras[nr, nc] if dr == 0 or dc == 0 else cost_ras[nr, nc] * np.sqrt(2)
-                new_cost = current_cost + move_cost
-                
-                if new_cost < cost_dist[nr, nc]:
-                    cost_dist[nr, nc] = new_cost
-                    direction[nr, nc] = direction_codes[i]
-                    heapq.heappush(pq, (new_cost, nr, nc))
-    
+            if not (0 <= nr < rows and 0 <= nc < cols) or visited[nr, nc]:
+                continue
+            cell = float(cost_ras[nr, nc])
+            if np.isnan(cell) or cell < 0:
+                continue
+            move_cost = cell if (dr == 0 or dc == 0) else cell * 1.41421356
+            new_cost = cur + move_cost
+            if new_cost < cost_dist[nr, nc]:
+                cost_dist[nr, nc] = new_cost
+                direction[nr, nc]  = codes[i]
+                heapq.heappush(pq, (new_cost, nr, nc))
     return cost_dist, direction
 
-def get_mcrpath(cost_dist, direction, target_ras, eight_directions):
-    target_points = np.argwhere(target_ras > 0)
+def trace_path(cost_dist, direction, target_ras, eight=True):
+    targets = np.argwhere(target_ras > 0)
+    if len(targets) == 0:
+        return []
+    costs = [cost_dist[r, c] for r, c in targets]
+    best = targets[int(np.argmin(costs))]
+    r, c = int(best[0]), int(best[1])
+    if np.isinf(cost_dist[r, c]):
+        return []
+    inverse = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)] if eight else [(1,0),(-1,0),(0,1),(0,-1)]
     path = []
+    visited = set()
+    for _ in range(cost_dist.size):
+        if not (0 <= r < cost_dist.shape[0] and 0 <= c < cost_dist.shape[1]):
+            return []
+        if (r, c) in visited:
+            return []
+        visited.add((r, c))
+        path.append((r, c))
+        d = int(direction[r, c])
+        if d < 0:
+            break
+        dr, dc = inverse[d]
+        r, c = r + dr, c + dc
+        if not (0 <= r < cost_dist.shape[0] and 0 <= c < cost_dist.shape[1]):
+            return []
+        if cost_dist[r, c] == 0:
+            break
+    return path[::-1]
 
-    # Directions and their inverses
-    if eight_directions:
-        inverse_directions = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
-    else:
-        inverse_directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-    
-    # Find the target point with the minimum cost
-    min_cost = np.inf
-    min_point = None
-    for r, c in target_points:
-        if cost_dist[r, c] < min_cost:
-            min_cost = cost_dist[r, c]
-            min_point = (r, c)
-    
-    # Backtrack from the target point to the source point
-    if min_point:
-        r, c = min_point
-        while cost_dist[r, c] != 0:
-            path.append((r, c))
-            direction_code = direction[r, c]
-            dr, dc = inverse_directions[int(direction_code)]
-            r, c = r + dr, c + dc
-        path.append((r, c))  # Add the source point
-    
-    return path[::-1]  # Reverse the path to start from the source
+def _is_continuous_path(path, eight=True):
+    if len(path) <= 1:
+        return False
+    for (r0, c0), (r1, c1) in zip(path[:-1], path[1:]):
+        dr = abs(int(r1) - int(r0))
+        dc = abs(int(c1) - int(c0))
+        if dr == 0 and dc == 0:
+            return False
+        if eight:
+            if dr > 1 or dc > 1:
+                return False
+        else:
+            if dr + dc != 1:
+                return False
+    return True
 
-def geodataframes_to_graph(points_gdf, lines_gdf):
-    # 创建一个空的无向图
-    G = nx.Graph()
 
-    # 添加点要素作为节点
-    for idx, point in points_gdf.iterrows():
-        # 获取点的经纬度
-        lat, lon = point.geometry.y, point.geometry.x
-        # 展开属性字典并添加 lat 和 lon
-        node_attributes = {f"{k}": str(v) if isinstance(v, dict) else v for k, v in point.items() if k != 'geometry'}
-        node_attributes['lat'] = lat
-        node_attributes['lon'] = lon
-        G.add_node(idx, **node_attributes)
+def _path_quality(path, resistance_raster):
+    if len(path) <= 1:
+        return None
+    total_cost = 0.0
+    total_len = 0.0
+    turns = 0
+    prev_dir = None
+    for (r0, c0), (r1, c1) in zip(path[:-1], path[1:]):
+        r1i, c1i = int(r1), int(c1)
+        cell = float(resistance_raster[r1i, c1i])
+        if np.isnan(cell) or cell < 0:
+            return None
+        dr = int(r1) - int(r0)
+        dc = int(c1) - int(c0)
+        step_len = 1.0 if (dr == 0 or dc == 0) else 1.41421356
+        total_len += step_len
+        total_cost += cell * step_len
+        step_dir = (0 if dr == 0 else (1 if dr > 0 else -1), 0 if dc == 0 else (1 if dc > 0 else -1))
+        if prev_dir is not None and step_dir != prev_dir:
+            turns += 1
+        prev_dir = step_dir
+    mean_cost = float(total_cost / max(1.0, total_len))
+    (rs, cs), (re, ce) = path[0], path[-1]
+    euclid = float(np.hypot(float(int(re) - int(rs)), float(int(ce) - int(cs))))
+    straightness = float(euclid / max(1e-12, total_len))
+    return {
+        'cost_sum': float(total_cost),
+        'cost_mean': mean_cost,
+        'turns': int(turns),
+        'len_w': float(total_len),
+        'straight': straightness,
+    }
 
-    # 添加线要素作为边
-    for idx, line in lines_gdf.iterrows():
-        # 确保线要素的起点和终点存在于点要素中
-        start_point = line.geometry.coords[0]
-        end_point = line.geometry.coords[-1]
-        
-        # 找到点要素中的起点和终点的索引
-        start_node = None
-        end_node = None
-        
-        for point_idx, point in points_gdf.iterrows():
-            if Point(start_point).equals(point.geometry):
-                start_node = point_idx
-            if Point(end_point).equals(point.geometry):
-                end_node = point_idx
-                
-        # 如果找到了起点和终点的匹配点，则添加边
-        if start_node is not None and end_node is not None:
-            # 不保留线的几何信息，只保留其他属性
-            edge_attributes = {f"{k}": str(v) if isinstance(v, dict) else v for k, v in line.items() if k != 'geometry'}
-            G.add_edge(start_node, end_node, **edge_attributes)
-    return G
+def _build_single_corridor(args):
+    """在子进程中构建单条廊道，返回结果元组（可 pickle）。"""
+    (node_i, node_j, pi, pj, pos_i, pos_j) = args
 
-def create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resistance_raster, adjacency_df):
-    unique_nodes = np.unique(node_raster[~np.isnan(node_raster) & (node_raster > 0)])
+    core_raster = _CORE_RASTER
+    res_ras = _RESISTANCE_RASTER
+    conn_ras = _CONNECTIVITY_RASTER
+    gt = _GT
+    proj_wkt = _PROJ_WKT
 
-    dataset = gdal.Open(node_raster_path)
-    geometry_list = []
-    attribute_list = []
-    point_geometry_list = []
-    point_attribute_list = []
-    
-    # 创建图
-    G = nx.Graph()
-    G1 = nx.Graph()
-    
-    # 添加节点
+    core_sub, origin = extract_subgrid(core_raster, pi, pj)
+    src_sub = (core_sub == node_i).astype(np.float32)
+    tgt_sub = (core_sub == node_j).astype(np.float32)
+    res_sub,  _     = extract_subgrid(res_ras, pi, pj)
+
+    cost_dist, direction = cost_distance(src_sub, res_sub, eight=True)
+    sub_path = trace_path(cost_dist, direction, tgt_sub, eight=True)
+    if len(sub_path) <= 1:
+        return None
+
+    path = restore_path(origin, sub_path)
+    if not _is_continuous_path(path, eight=True):
+        return None
+
+    arr_path = np.array(path)
+    if arr_path.size == 0:
+        return None
+    if np.any(arr_path[:, 0] < 0) or np.any(arr_path[:, 1] < 0):
+        return None
+    if np.any(arr_path[:, 0] >= core_raster.shape[0]) or np.any(arr_path[:, 1] >= core_raster.shape[1]):
+        return None
+    if int(core_raster[int(path[0][0]), int(path[0][1])]) != int(node_i):
+        return None
+    if int(core_raster[int(path[-1][0]), int(path[-1][1])]) != int(node_j):
+        return None
+    mask_others = np.zeros(core_raster.shape, dtype=bool)
+    mask_others[(core_raster != 0) & (core_raster != node_i) & (core_raster != node_j)] = True
+    if np.any(mask_others[arr_path[:, 0], arr_path[:, 1]]):
+        return None
+
+
+    q = _path_quality(path, res_ras)
+    if q is None:
+        return None
+    conn_vals = [float(conn_ras[r, c])
+                 for r, c in path
+                 if 0 <= r < conn_ras.shape[0]
+                 and 0 <= c < conn_ras.shape[1]
+                 and 0 <= c < conn_ras.shape[1]
+                 and not np.isnan(conn_ras[r, c])]
+    mean_w = float(np.mean(conn_vals)) if conn_vals else 0.0
+    sum_w  = float(np.sum(conn_vals))  if conn_vals else 0.0
+
+    spine_results = []
+
+    for src_pos, act_pos, nid in [
+        (pos_i, path[0],  node_i),
+        (pos_j, path[-1], node_j),
+    ]:
+        res_sub2, origin2 = extract_subgrid(res_ras, src_pos, act_pos)
+        src_sub2 = np.zeros(res_sub2.shape, dtype=np.float32)
+        tgt_sub2 = np.zeros(res_sub2.shape, dtype=np.float32)
+        r0 = int(src_pos[0] - origin2[0]); c0 = int(src_pos[1] - origin2[1])
+        r1 = int(act_pos[0] - origin2[0]); c1 = int(act_pos[1] - origin2[1])
+        if 0 <= r0 < src_sub2.shape[0] and 0 <= c0 < src_sub2.shape[1]:
+            src_sub2[r0, c0] = 1.0
+        if 0 <= r1 < tgt_sub2.shape[0] and 0 <= c1 < tgt_sub2.shape[1]:
+            tgt_sub2[r1, c1] = 1.0
+
+        cd2, dir2 = cost_distance(src_sub2, res_sub2, eight=True)
+        sp2 = trace_path(cd2, dir2, tgt_sub2, eight=True)
+        if len(sp2) > 1:
+            gpath2 = restore_path(origin2, sp2)
+            if not _is_continuous_path(gpath2, eight=True):
+                continue
+            conn2 = [float(conn_ras[r, c])
+                     for r, c in gpath2
+                     if 0 <= r < conn_ras.shape[0]
+                     and 0 <= c < conn_ras.shape[1]
+                     and not np.isnan(conn_ras[r, c])]
+            mw2 = float(np.mean(conn2)) if conn2 else 0.0
+            sw2 = float(np.sum(conn2))  if conn2 else 0.0
+            spine_results.append({
+                'fromnode': nid, 'tonode': nid,
+                'weight': mw2, 'sum_weight': sw2,
+                'len': len(sp2), 'type': 'S',
+                'path': gpath2,
+            })
+
+    return {
+        'node_i': node_i, 'node_j': node_j,
+        'mean_w': mean_w, 'sum_w': sum_w, 'path_len': len(path),
+        'path': path,
+        'quality': q,
+        'spine_results': spine_results,
+    }
+
+def build_ecological_network(node_raster, core_raster,
+                             connectivity_raster, resistance_raster,
+                             adjacency_df, dataset, n_workers=None):
+    if n_workers is None:
+        env_workers = os.environ.get('ELT_N_WORKERS', '').strip()
+        if env_workers.isdigit():
+            n_workers = max(1, int(env_workers))
+        else:
+            n_workers = min(8, max(1, mp.cpu_count() - 1))
+
+    proj_wkt = dataset.GetProjection()
+    gt = dataset.GetGeoTransform()
+
+    unique_nodes = np.unique(node_raster[~np.isnan(node_raster) & (node_raster > 0)]).astype(int)
     node_positions = {}
     for node in unique_nodes:
-        pos = convert_to_int_tuple(np.argwhere(node_raster == node)[0])
-        lon, lat = pixel_to_geo(dataset, pos[1], pos[0])
+        pos = np.argwhere(node_raster == node)
+        if len(pos) > 0:
+            node_positions[int(node)] = (int(pos[0][0]), int(pos[0][1]))
+
+    G = nx.Graph()
+    G_act = nx.Graph()
+    for node, (r, c) in node_positions.items():
+        lon, lat = pixel_to_geo(dataset, c, r)
         G.add_node(node, lon=lon, lat=lat)
-        G1.add_node(node, lon=lon, lat=lat)
-        node_positions[node] = pos
-        point_geometry_list.append((lon,lat))
-        point_attribute_list.append({"nodeid": node,"sourceid": node ,"type":'S'})
-    
-    nique_values_block = adjacency_df['Block'].unique()
-    G1nodeId = len(node_positions)
-    G1lineId = 0
-    for node_i in tqdm(nique_values_block, total=len(nique_values_block), desc="Processing Rows"):
-        Adjacent_block = adjacency_df.loc[adjacency_df['Block'] == node_i, 'Adjacent']
-        source_ras = np.zeros(connectivity_raster.shape)
-        source_ras[np.where(core_raster == node_i)] = 1
-        for node_j in Adjacent_block:
-            target_ras = np.zeros(connectivity_raster.shape)
-            target_ras[np.where(core_raster == node_j)] = 1
-            condition = (adjacency_df['Block'] == node_i) & (adjacency_df['Adjacent'] == node_j)
-            pi_light = np.array(adjacency_df.loc[condition, ['NearestP_Block1_X', 'NearestP_Block1_Y']])[0]
-            pj_light = np.array(adjacency_df.loc[condition, ['NearestP_Block2_X', 'NearestP_Block2_Y']])[0]
+        G_act.add_node(node, lon=lon, lat=lat)
 
-            source_rassub, source_origin = extract_subgrid(source_ras, pi_light, pj_light)
-            target_rassub, _ = extract_subgrid(target_ras, pi_light, pj_light)
-            connectivity_sub, _ = extract_subgrid(resistance_raster, pi_light, pj_light)
+    core_rows, core_cols = core_raster.shape
+    res_rows, res_cols = resistance_raster.shape
+    conn_rows, conn_cols = connectivity_raster.shape
 
-            cost_dist, direction = cost_distance_with_direction(source_rassub, connectivity_sub, True)
-            subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
-            path = restore_path_to_global(source_origin, subpath)
+    pairs = []
+    for _, row in adjacency_df.iterrows():
+        node_i = int(row['Block'])
+        node_j = int(row['Adjacent'])
+        pos_i = node_positions.get(node_i)
+        pos_j = node_positions.get(node_j)
+        if pos_i is None or pos_j is None:
+            continue
+        pi = (int(row['NearestP_Block1_X']), int(row['NearestP_Block1_Y']))
+        pj = (int(row['NearestP_Block2_X']), int(row['NearestP_Block2_Y']))
+        pairs.append((node_i, node_j, pi, pj, pos_i, pos_j))
 
-            if len(path) <= 1:
-                eightConn.append(str(node_i) + "--" +str(node_j))
-                continue
-            
-            updataMask = np.zeros(core_raster.shape)
-            updataMask[np.where((core_raster!=0)&(core_raster!=node_i)&(core_raster!=node_j))] = 1
-            maskIndex = np.array([updataMask[p[0], p[1]] for p in path])
-            sourceN = np.sum(maskIndex)
+    env_max_pairs = os.environ.get('ELT_MAX_PAIRS', '').strip()
+    if env_max_pairs.isdigit():
+        max_pairs = max(1, int(env_max_pairs))
+        pairs = pairs[:max_pairs]
 
-            if sourceN == 0: #当廊道不经过其它斑块时保留此廊道
-                pathList = [connectivity_raster[p[0], p[1]] for p in path]
-                mean_weight = np.mean(pathList)
-                sum_weight = np.sum(pathList)
-                min_len = len(path)
-                
-                # 计算源点对应的地理坐标
-                fromPointS = pixel_to_geo(dataset, node_positions[node_i][1], node_positions[node_i][0])
-                toPointS = pixel_to_geo(dataset, node_positions[node_j][1], node_positions[node_j][0])
-                # 计算activateP对应的地理坐标
-                fromPoint = pixel_to_geo(dataset, path[0][1], path[0][0])
-                toPoint = pixel_to_geo(dataset, path[-1][1], path[-1][0])
+    print(f"构建廊道（共 {len(pairs)} 对邻接斑块，使用 {n_workers} 进程）...")
 
-                actId_pi = G1nodeId + 1
-                actId_pj = G1nodeId + 2
-                G1nodeId = actId_pj
+    results = []
+    skipped = 0
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(core_raster, resistance_raster, connectivity_raster, gt, proj_wkt),
+    ) as executor:
+        for res in tqdm(
+            executor.map(_build_single_corridor, pairs, chunksize=max(1, len(pairs) // (n_workers * 4))),
+            total=len(pairs), desc="廊道构建（并行）"
+        ):
+            if res is None:
+                skipped += 1
+            else:
+                results.append(res)
 
-                lineId_L = G1lineId + 1
-                lineId_Li = G1lineId + 2
-                lineId_Lj = G1lineId + 3
-                G1lineId = lineId_Lj
+    geom_lines, attr_lines = [], []
+    geom_points, attr_points = [], []
+    act_node_id = int(max(node_positions.keys())) + 1 if node_positions else 1
+    line_id = 0
 
-                # 保存对应源点的OD Graph和相应属性
-                G.add_edge(node_i, node_j, weight=mean_weight, sum_weight=sum_weight, distance = min_len,fromx = fromPointS[0], fromy = fromPointS[1], tox = toPointS[0], toy =toPointS[1])
+    for node, (r, c) in node_positions.items():
+        lon, lat = pixel_to_geo(dataset, c, r)
+        geom_points.append(Point(lon, lat))
+        attr_points.append({"nodeid": node, "sourceid": node, "type": 'S'})
 
-                # 保存踏脚石之间的廊道数据为Shp数据
-                min_geopath = [pixel_to_geo(dataset, mp[1], mp[0]) for mp in path]
-                line_geom = LineString(min_geopath)
-                geometry_list.append(line_geom)
-                attribute_list.append({"fromnode": node_i,"tonode":node_j,"fromX": fromPoint[0], "fromY": fromPoint[1], "toX": toPoint[0], "toY": toPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": min_len,"type":'T',"lineid": lineId_L})
-                G1.add_node(actId_pi, lon=fromPoint[0], lat=fromPoint[1])
-                G1.add_node(actId_pj, lon=toPoint[0], lat=toPoint[1])
-                G1.add_edge(actId_pi, actId_pj, weight=mean_weight, sum_weight=sum_weight, distance = min_len,fromx = fromPoint[0], fromy = fromPoint[1], tox = toPoint[0], toy =toPoint[1], lineid = lineId_L)
+    for res in results:
+        line_id += 1
+        act_i = act_node_id; act_node_id += 1
+        act_j = act_node_id; act_node_id += 1
 
-                # 保存踏脚石数据为Shp数据
-                point_geometry_list.append(fromPoint)
-                point_attribute_list.append({"nodeid": actId_pi,"sourceid": node_i,"type":'A'})
-                point_geometry_list.append(toPoint)
-                point_attribute_list.append({"nodeid": actId_pj,"sourceid": node_j,"type":'A'})
+        G.add_edge(res['node_i'], res['node_j'],
+                   weight=res['mean_w'], sum_weight=res['sum_w'],
+                   distance=res['path_len'],
+                   cost_sum=float(res.get('quality', {}).get('cost_sum', 0.0)),
+                   cost_mean=float(res.get('quality', {}).get('cost_mean', 0.0)),
+                   turns=int(res.get('quality', {}).get('turns', 0)),
+                   len_w=float(res.get('quality', {}).get('len_w', 0.0)),
+                   straight=float(res.get('quality', {}).get('straight', 0.0)))
 
-                # 补充源点到踏脚石的廊道数据
-                source_rassub, target_rassub, source_origin = extract_centerP(source_ras, node_positions[node_i], path[0])
-                connectivity_sub, _ = extract_subgrid(resistance_raster, node_positions[node_i], path[0])
+        pix_path = res['path']
+        geo_path = [pixel_to_geo(dataset, c, r) for r, c in pix_path]
+        fp = geo_path[0]
+        tp = geo_path[-1]
+        geom_lines.append(LineString(geo_path))
+        attr_lines.append({
+            "fromnode": res['node_i'], "tonode": res['node_j'],
+            "fromX": fp[0], "fromY": fp[1],
+            "toX": tp[0], "toY": tp[1],
+            "weight": res['mean_w'], "sum_weight": res['sum_w'],
+            "len": res['path_len'], "type": 'T', "lineid": line_id,
+            "cost_sum": float(res.get('quality', {}).get('cost_sum', 0.0)),
+            "cost_mean": float(res.get('quality', {}).get('cost_mean', 0.0)),
+            "turns": int(res.get('quality', {}).get('turns', 0)),
+            "len_w": float(res.get('quality', {}).get('len_w', 0.0)),
+            "straight": float(res.get('quality', {}).get('straight', 0.0)),
+        })
 
-                cost_dist, direction = cost_distance_with_direction(source_rassub, connectivity_sub, True)
-                subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
-                path1 = restore_path_to_global(source_origin, subpath)
-                geopath1 = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path1]
-                if len(geopath1) > 1:
-                    line_geom = LineString(geopath1)
-                    geometry_list.append(line_geom)
-                    pathList = [connectivity_raster[p[0], p[1]] for p in path1]
-                    mean_weight = np.mean(pathList)
-                    sum_weight = np.sum(pathList)
-                    lenc = len(path)
-                    attribute_list.append({"fromnode": node_i,"tonode":node_i,"fromX": fromPointS[0], "fromY": fromPointS[1], "toX": fromPoint[0], "toY": fromPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Li})
+        G_act.add_node(act_i, lon=fp[0], lat=fp[1])
+        G_act.add_node(act_j, lon=tp[0], lat=tp[1])
+        G_act.add_edge(
+            act_i, act_j,
+            weight=res['mean_w'],
+            sum_weight=res['sum_w'],
+            distance=res['path_len'],
+            lineid=line_id,
+            cost_sum=float(res.get('quality', {}).get('cost_sum', 0.0)),
+            cost_mean=float(res.get('quality', {}).get('cost_mean', 0.0)),
+            turns=int(res.get('quality', {}).get('turns', 0)),
+            len_w=float(res.get('quality', {}).get('len_w', 0.0)),
+            straight=float(res.get('quality', {}).get('straight', 0.0)),
+        )
+        geom_points.extend([Point(fp), Point(tp)])
+        attr_points.extend([
+            {"nodeid": act_i, "sourceid": res['node_i'], "type": 'A'},
+            {"nodeid": act_j, "sourceid": res['node_j'], "type": 'A'},
+        ])
 
-                source_rassub, target_rassub, source_origin = extract_centerP(source_ras, node_positions[node_j], path[-1])
-                connectivity_sub, _ = extract_subgrid(resistance_raster, node_positions[node_j], path[-1])
-                cost_dist, direction = cost_distance_with_direction(source_rassub, connectivity_sub, True)
-                subpath = get_mcrpath(cost_dist, direction, target_rassub, True)
-                path2 = restore_path_to_global(source_origin, subpath)
-                geopath2 = [pixel_to_geo(dataset, cp[1], cp[0]) for cp in path2]
-                if len(geopath2) > 1:
-                    line_geom = LineString(geopath2)
-                    geometry_list.append(line_geom)
-                    pathList = [connectivity_raster[p[0], p[1]] for p in path2]
-                    mean_weight = np.mean(pathList)
-                    sum_weight = np.sum(pathList)
-                    lenc = len(path)
-                    attribute_list.append({"fromnode": node_j,"tonode":node_j,"fromX": toPointS[0], "fromY": toPointS[1], "toX": toPoint[0], "toY": toPoint[1], "weight": mean_weight, "sum_weight":sum_weight, "len": lenc,"type":'S',"lineid": lineId_Lj})
+        for sp in res['spine_results']:
+            line_id += 1
+            pix_spine = sp['path']
+            geo_spine = [pixel_to_geo(dataset, c, r) for r, c in pix_spine]
+            from_geo = geo_spine[0]
+            to_geo = geo_spine[-1]
+            geom_lines.append(LineString(geo_spine))
+            attr_lines.append({
+                "fromnode": sp['fromnode'], "tonode": sp['tonode'],
+                "fromX": from_geo[0], "fromY": from_geo[1],
+                "toX": to_geo[0], "toY": to_geo[1],
+                "weight": sp['weight'], "sum_weight": sp['sum_weight'],
+                "len": sp['len'], "type": sp['type'], "lineid": line_id,
+            })
 
-    # 保存踏脚石之间的廊道数据为Shp数据
-    gdf = gpd.GeoDataFrame(attribute_list, crs="EPSG:4326", geometry=geometry_list)
-    gdf['wkb_geometry'] = gdf['geometry'].apply(lambda geom: geom.wkb)
-    gdf_unique = gdf.loc[gdf.groupby('wkb_geometry')['lineid'].idxmin()]
-    gdf_unique = gdf_unique.drop(columns='wkb_geometry')
+    if skipped:
+        print(f"跳过 {skipped} 条廊道（路径过短或穿过其他斑块）")
 
-    # 保存踏脚石数据为Shp数据
-    dfpoint = pd.DataFrame(point_geometry_list, columns=['longitude', 'latitude'])
-    geometrypoint = [Point(xy) for xy in zip(dfpoint['longitude'], dfpoint['latitude'])]
-    gdfpoint = gpd.GeoDataFrame(point_attribute_list, crs="EPSG:4326", geometry=geometrypoint)
-    gdfpoint['wkb_geometry'] = gdfpoint['geometry'].apply(lambda geom: geom.wkb)
-    gdfpoint_unique = gdfpoint.loc[gdfpoint.groupby('wkb_geometry')['nodeid'].idxmin()]
-    gdfpoint_unique = gdfpoint_unique.drop(columns='wkb_geometry')
+    gdf_lines = gpd.GeoDataFrame(attr_lines, crs="EPSG:4326", geometry=geom_lines)
+    if len(gdf_lines) > 0:
+        gdf_lines['_wkb'] = gdf_lines.geometry.apply(lambda g: g.wkb)
+        gdf_lines = gdf_lines.loc[
+            gdf_lines.groupby('_wkb')['lineid'].idxmin()
+        ].drop(columns='_wkb').reset_index(drop=True)
 
-    G_act = geodataframes_to_graph(gdfpoint_unique, gdf_unique)
-    return G, G_act , gdf_unique, gdfpoint_unique
+    gdf_points = gpd.GeoDataFrame(attr_points, crs="EPSG:4326", geometry=geom_points)
+    if len(gdf_points) > 0:
+        gdf_points['_wkb'] = gdf_points.geometry.apply(lambda g: g.wkb)
+        gdf_points = gdf_points.loc[
+            gdf_points.groupby('_wkb')['nodeid'].idxmin()
+        ].drop(columns='_wkb').reset_index(drop=True)
 
-def save_graph_to_graphml(graph, file_path):
-    nx.write_graphml(graph, file_path)
-
+    return G, G_act, gdf_lines, gdf_points
 
 if __name__ == '__main__':
-    # node_raster_path景观源点数据路径；mspa_core_path景观Core区数据；
-    node_raster_path = r'InputData\mspa_core_filled_center.tif'
-    mspa_core_path = r'InputData\mspa_core_filled.tif'
-    node_raster,im_porj, im_geotrans = GeoImgR(node_raster_path)
-    core_raster,_,_ = GeoImgR(mspa_core_path)
-  
-    # 加载连通性数据和阻力面数据
-    connectivity_raster_path = r'InputData\cum_update.tif'
-    resistance_raster_file = r'InputData\cum_weight_core0714.tif'
-    connectivity_raster,_,_ = GeoImgR(connectivity_raster_path)
-    resistance_raster,_,_ = GeoImgR(resistance_raster_file)
+    print("="*60)
+    print("生态廊道构建工具 - 最小累积阻力模型（并行版）")
+    print("="*60)
 
-    adj_csv_path = r'OutputData/adjacency_parallel.csv'
-    adjacency_df = read_adjacency_csv(adj_csv_path)
+    base_dir   = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    input_dir  = os.path.join(base_dir, 'InputData')
+    output_dir  = os.path.join(base_dir, 'OutputData')
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 输出文件路径
-    graphml_file_path = r'OutputData/ecological_network1111_mcr.graphml'
-    graphml_act_file_path = r'OutputData/ecological_network1111_mcr_act.graphml'
-    shpline_file_path = r'OutputData/ecological_network1111_mcr.shp'
-    shppoint_file_path = r'OutputData/ecological_network1111_mcr_point.shp'
+    node_raster_path    = os.path.join(output_dir, 'mspa_core_center.tif')
+    mspa_core_path      = os.path.join(output_dir, 'mspa_core_filled.tif')
+    connectivity_path   = os.path.join(input_dir,  'Connectivity.tif')
+    resistance_path     = os.path.join(input_dir,  'ResistanceSurface.tif')
+    adj_csv_path        = os.path.join(output_dir, 'adjacency_parallel.csv')
 
-    # ****************************************************************创建生态网络
-    eightConn = []
-    ecological_network,ecological_network_act,corrdors,point  = create_graph_from_rasters(node_raster, core_raster,connectivity_raster, resistance_raster,adjacency_df)
-    print(eightConn)
+    shp_line  = os.path.join(output_dir, 'ecological_network.shp')
+    shp_point = os.path.join(output_dir, 'ecological_network_point.shp')
 
-    # 保存图结构到GraphML文件
-    save_graph_to_graphml(ecological_network, graphml_file_path)  #仅仅包括生态源点的网络
-    save_graph_to_graphml(ecological_network_act, graphml_act_file_path)  #包括激活点的网络
-    corrdors.to_file(shpline_file_path)
-    point.to_file(shppoint_file_path)
+    print("读取栅格数据...")
+    node_ds = gdal.Open(node_raster_path)
+    node_raster, _, _  = GeoImgR(node_raster_path)
+    core_raster,  _, _ = GeoImgR(mspa_core_path)
+    conn_raster,  _, _ = GeoImgR(connectivity_path)
+    res_raster,   _, _ = GeoImgR(resistance_path)
 
-    # screen -L -Logfile getcorridor_mcr1107_300.log python 3_GetCorridorAN.py
+    adjacency_df = pd.read_csv(adj_csv_path)
+    print(f"邻接斑块对数: {len(adjacency_df)}")
+
+    print("构建生态网络...")
+    G, G_act, gdf_lines, gdf_points = build_ecological_network(
+        node_raster, core_raster, conn_raster, res_raster,
+        adjacency_df, node_ds
+    )
+    del node_ds
+
+    print("保存结果...")
+    nx.write_graphml(G,     os.path.join(output_dir, "ecological_network.graphml"))
+    nx.write_graphml(G_act, os.path.join(output_dir, "ecological_network_act.graphml"))
+    gdf_lines.to_file(shp_line)
+    print(f"  廊道矢量: {shp_line}  ({len(gdf_lines)} 条)")
+    gdf_points.to_file(shp_point)
+    print(f"  节点矢量: {shp_point} ({len(gdf_points)} 个)")
+    print("完成！")

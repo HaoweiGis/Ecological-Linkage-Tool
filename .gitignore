@@ -1,2 +1,30 @@
-.vscode
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# BuildEXE 打包产物
+BuildEXE/__pycache__/
+BuildEXE/build/
+BuildEXE/dist/
+
+# 各版本输出数据
+HistoryVersion/
 OutputData/
+OutputData_BuildEXE/
+OutputData_V1/
+OutputData_V2/
+OutputData_EXE/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GDAL/ArcGIS 栅格概览文件
+*.ovr

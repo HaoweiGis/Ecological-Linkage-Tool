@@ -1,0 +1,10 @@
+numpy>=1.24
+scipy>=1.10
+rasterio>=1.3
+geopandas>=0.14
+shapely>=2.0
+networkx>=3.0
+pandas>=2.0
+tqdm>=4.65
+pyproj>=3.5
+pyinstaller>=5.0

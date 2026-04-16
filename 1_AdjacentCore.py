@@ -1,13 +1,11 @@
+# 执行时间记录（geobase；InputData -> OutputData；2026-04-16）
+# 本脚本：1.56 s
+
 import numpy as np
+import pandas as pd
 from osgeo import gdal
 from scipy.ndimage import distance_transform_edt
-import cv2
-import rasterio
-import pandas as pd
-import tqdm
-from multiprocessing import Pool, cpu_count
 
-# 读取栅格数据
 def read_raster(file_path):
     dataset = gdal.Open(file_path)
     band = dataset.GetRasterBand(1)
@@ -15,165 +13,97 @@ def read_raster(file_path):
     nodata_value = band.GetNoDataValue()
     return array, dataset, nodata_value
 
-# 保存栅格数据
 def write_raster(file_path, array, dataset, nodata_value):
     driver = gdal.GetDriverByName('GTiff')
-    out_dataset = driver.Create(file_path, dataset.RasterXSize, dataset.RasterYSize, 1, gdal.GDT_Int32)
+    out_dataset = driver.Create(
+        file_path, dataset.RasterXSize, dataset.RasterYSize, 1, gdal.GDT_Int32,
+        options=["TILED=YES", "COMPRESS=LZW"]
+    )
     out_dataset.SetGeoTransform(dataset.GetGeoTransform())
     out_dataset.SetProjection(dataset.GetProjection())
     out_band = out_dataset.GetRasterBand(1)
     out_band.WriteArray(array)
     out_band.SetNoDataValue(nodata_value)
     out_band.FlushCache()
+    del out_dataset
 
-# 欧几里得分配算法
 def euclidean_allocation(raster_array, nodata_value):
-    # 创建源点掩码
     valid_mask = (raster_array != nodata_value).astype(int)
-    
-    # 计算欧几里得距离
-    distances, indices = distance_transform_edt(1 - valid_mask, return_indices=True)
-    
-    # 分配区域
-    allocation = np.full_like(raster_array, nodata_value)
-    for i in range(allocation.shape[0]):
-        for j in range(allocation.shape[1]):
-            allocation[i, j] = raster_array[indices[0, i, j], indices[1, i, j]]
-    
-    return distances, allocation
+    _, indices = distance_transform_edt(1 - valid_mask, return_indices=True)
+    allocation = raster_array[indices[0], indices[1]]
+    return allocation
 
-# 判断是否相邻
-def is_adjacent(block1, block2):
-    # 转换为8位无符号整数类型
-    block1_uint8 = block1.astype(np.uint8)
-    block2_uint8 = block2.astype(np.uint8)
-    struct = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
-    dilated_block1 = cv2.dilate(block1_uint8, struct, iterations=1)
-    return np.any(dilated_block1 & block2_uint8)
+def compute_adjacency(allocation, nodata_value=0, validate=False):
+    pair_chunks = []
+    shifts = [
+        (slice(None),      slice(None, -1),  slice(None),      slice(1, None)),
+        (slice(None, -1),  slice(None),      slice(1, None),   slice(None)),
+        (slice(None, -1),  slice(None, -1),  slice(1, None),   slice(1, None)),
+        (slice(None, -1),  slice(1, None),   slice(1, None),   slice(None, -1)),
+    ]
+    for r1, c1, r2, c2 in shifts:
+        v1 = allocation[r1, c1]
+        v2 = allocation[r2, c2]
+        mask = (v1 != v2) & (v1 > 0) & (v2 > 0)
+        if nodata_value is not None:
+            mask &= (v1 != nodata_value) & (v2 != nodata_value)
+        if np.any(mask):
+            pairs = np.column_stack((v1[mask], v2[mask]))
+            pairs = np.sort(pairs, axis=1)
+            pair_chunks.append(pairs.astype(np.int64, copy=False))
 
-# ******************************************************************Single thread
-# 计算邻接关系
-def compute_adjacency_single(raster_array, nodata_value):
-    unique_values = np.unique(raster_array)
-    unique_values = unique_values[unique_values != nodata_value]
-    
-    adjacency_list = []
-    
-    for value1 in tqdm.tqdm(unique_values):
-        block1 = (raster_array == value1)
-        adjacent_blocks = []
-        
-        for value2 in unique_values:
-            if value1 >= value2: #计算单向连通
-                continue
-            block2 = (raster_array == value2)
-            if is_adjacent(block1, block2):
-                adjacent_blocks.append(value2)
-    
-        adjacency_list.append((value1, adjacent_blocks))
-    
-    return adjacency_list
+    if not pair_chunks:
+        return []
 
-# ******************************************************************Parallel
-# 计算某个值的邻接关系
-def compute_adjacency_for_value(args):
-    value1, unique_values, raster_array, nodata_value = args
-    block1 = (raster_array == value1)
-    adjacent_blocks = []
+    all_pairs = np.vstack(pair_chunks)
+    unique_pairs = np.unique(all_pairs, axis=0)
 
-    for value2 in unique_values:
-        if value1 >= value2: #计算单向连通
-            continue
-        block2 = (raster_array == value2)
-        if is_adjacent(block1, block2):
-            adjacent_blocks.append(value2)
+    if validate:
+        if np.any(unique_pairs[:, 0] == unique_pairs[:, 1]):
+            raise ValueError("self-loop adjacency pair detected")
+        if unique_pairs.shape[0] != len({(int(a), int(b)) for a, b in unique_pairs}):
+            raise ValueError("duplicate adjacency pair detected")
 
-    return (value1, adjacent_blocks)
+    return [(int(a), int(b)) for a, b in unique_pairs]
 
-# 计算邻接关系
-def compute_adjacency_parallel(raster_array, nodata_value):
-    unique_values = np.unique(raster_array)
-    unique_values = unique_values[unique_values != nodata_value]
-    
-    args = [(value1, unique_values, raster_array, nodata_value) for value1 in unique_values]
-
-    with Pool(processes=cpu_count()) as pool:
-        adjacency_list = pool.map(compute_adjacency_for_value, args)
-
-    return adjacency_list
-
-# 读取邻接关系
-def read_adjacency_csv(csv_path):
-    return pd.read_csv(csv_path)
-
-# 保存为CSV文件
-def save_to_csv(adjacency_list, output_path):
-    data = []
-    for block, adjacents in adjacency_list:
-        for adj in adjacents:
-            data.append([block, adj])
-    
-    df = pd.DataFrame(data, columns=['Block', 'Adjacent'])
+def save_to_csv(adjacency_pairs, output_path):
+    df = pd.DataFrame(adjacency_pairs, columns=['Block', 'Adjacent'])
     df.to_csv(output_path, index=False)
 
-# ******************************************************************用于验证的相关函数
-# 读取影像文件并获取唯一值
-def get_image_unique_values(image_path):
-    with rasterio.open(image_path) as src:
-        image_data = src.read(1)  # 读取第一波段数据
-        unique_values = np.unique(image_data)
-    return unique_values
-
-# 读取CSV文件并获取['Block', 'Adjacent']列中的唯一值
-def get_csv_unique_values(csv_path):
-    df = pd.read_csv(csv_path)
-    unique_values_block = df['Block'].unique()
-    unique_values_adjacent = df['Adjacent'].unique()
-    combined_unique_values = np.unique(np.concatenate((unique_values_block, unique_values_adjacent)))
-    return combined_unique_values
-
-# 查找在影像唯一值中存在而在CSV文件中缺失的值
-def find_missing_values(image_unique_values, csv_unique_values):
-    missing_values = np.setdiff1d(image_unique_values, csv_unique_values)
-    return missing_values
-
-
-# # 主程序
 if __name__ == '__main__':
-    input_raster_path = r'InputData\mspa_core_filled.tif'
-    output_distance_path = r'OutputData\mspa_core_filled_eucdis.tif'
-    output_allocation_path = r'OutputData\mspa_core_filled_eucall.tif'
-    adj_csv_path =r'OutputData\adjacency_parallel.csv'
+    import os
 
-    # ******************************************************************计算邻接关系 step1
-    # 读取输入栅格
+    base_dir = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    output_dir = os.path.join(base_dir, 'OutputData')
+    os.makedirs(output_dir, exist_ok=True)
+
+    input_raster_path   = os.path.join(output_dir, 'mspa_core_filled.tif')
+    output_allocation    = os.path.join(output_dir, 'mspa_core_filled_eucall.tif')
+    adj_csv_path        = os.path.join(output_dir, 'adjacency_parallel.csv')
+
+    print("读取栅格...")
     raster_array, dataset, nodata_value = read_raster(input_raster_path)
+    nodata_int = int(nodata_value) if nodata_value is not None else 0
 
-    # ******************************************************************空间分配
-    # 计算欧几里得距离和分配区域
-    distances, allocation = euclidean_allocation(raster_array, nodata_value)
+    print("欧氏分配...")
+    allocation = euclidean_allocation(raster_array, nodata_int)
 
-    # 保存输出栅格
-    # write_raster(output_distance_path, distances, dataset, nodata_value)
-    write_raster(output_allocation_path, allocation, dataset, nodata_value)
-    # print("欧几里得分配完成。")
+    print("保存分配栅格...")
+    write_raster(output_allocation, allocation, dataset, 0)
 
-    # ******************************************************************计算邻接关系 step2
-    # 计算邻接关系
-    # adjacency_list = compute_adjacency_single(allocation,nodata_value)
-    adjacency_list = compute_adjacency_parallel(allocation,nodata_value)
-    # 保存邻接关系为CSV文件
-    save_to_csv(adjacency_list, adj_csv_path)
-    print("邻接关系计算完成，结果已保存为CSV文件。")
+    print("计算邻接关系（向量化扫描）...")
+    adjacency_pairs = compute_adjacency(allocation, nodata_int, validate=True)
+    print(f"  邻接对数: {len(adjacency_pairs)}")
 
-    # ******************************************************************验证是否存在漏掉的斑块
-    # 获取影像唯一值和CSV唯一值
-    image_unique_values = get_image_unique_values(input_raster_path)
-    csv_unique_values = get_csv_unique_values(adj_csv_path)
-    # 查找缺失的值
-    missing_values = find_missing_values(image_unique_values, csv_unique_values)
-    # 打印缺失的值
-    print("缺失的值:", missing_values)
+    save_to_csv(adjacency_pairs, adj_csv_path)
+    print(f"邻接关系计算完成，结果已保存为CSV文件: {adj_csv_path}")
 
-    # screen -L -Logfile 1_adj_parallel.log python 1_AdjacentCore.py
-    # screen -L -Logfile 1_adj_single.log python 1_AdjacentCore.py
+    patch_ids = set(int(v) for v in np.unique(allocation) if v > 0)
+    csv_ids = set()
+    for b, a in adjacency_pairs:
+        csv_ids.add(b); csv_ids.add(a)
+    missing = patch_ids - csv_ids
+    if missing:
+        print(f"孤立斑块（无邻接）: {sorted(missing)}")
+    else:
+        print("所有斑块均有邻接关系")
