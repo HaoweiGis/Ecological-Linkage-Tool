@@ -29,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 
 _transformer_cache = {}
+_pyproj_transformer_cache = {}
 _CORE_RASTER = None
 _RESISTANCE_RASTER = None
 _CONNECTIVITY_RASTER = None
@@ -36,6 +37,11 @@ _GT = None
 _PROJ_WKT = None
 _PROJ_READY = False
 
+try:
+    from pyproj import CRS, Transformer
+except Exception:
+    CRS = None
+    Transformer = None
 
 def _init_worker(core_raster, resistance_raster, connectivity_raster, gt, proj_wkt):
     global _CORE_RASTER, _RESISTANCE_RASTER, _CONNECTIVITY_RASTER, _GT, _PROJ_WKT
@@ -107,16 +113,38 @@ def _get_transformer(src_wkt):
         _transformer_cache[src_wkt] = osr.CoordinateTransformation(src, dst)
     return _transformer_cache[src_wkt]
 
+def _get_pyproj_transformer(src_wkt):
+    if Transformer is None or CRS is None:
+        return None
+    if not src_wkt:
+        return None
+    if src_wkt not in _pyproj_transformer_cache:
+        try:
+            src = CRS.from_wkt(src_wkt)
+            dst = CRS.from_epsg(4326)
+            _pyproj_transformer_cache[src_wkt] = Transformer.from_crs(src, dst, always_xy=True)
+        except Exception:
+            _pyproj_transformer_cache[src_wkt] = None
+    return _pyproj_transformer_cache[src_wkt]
+
 def pixel_to_geo(dataset, col, row):
     gt = dataset.GetGeoTransform()
     px = gt[0] + col * gt[1] + row * gt[2]
     py = gt[3] + col * gt[4] + row * gt[5]
-    return px, py
+    transformer = _get_pyproj_transformer(dataset.GetProjection())
+    if transformer is not None:
+        lon, lat = transformer.transform(float(px), float(py))
+        return float(lon), float(lat)
+    return float(px), float(py)
 
 def pixel_to_geo_by_gt(gt, proj_wkt, col, row):
     px = gt[0] + col * gt[1] + row * gt[2]
     py = gt[3] + col * gt[4] + row * gt[5]
-    return px, py
+    transformer = _get_pyproj_transformer(proj_wkt)
+    if transformer is not None:
+        lon, lat = transformer.transform(float(px), float(py))
+        return float(lon), float(lat)
+    return float(px), float(py)
 
 def GeoImgR(filename):
     dataset = gdal.Open(filename)
@@ -213,6 +241,7 @@ def trace_path(cost_dist, direction, target_ras, eight=True):
         if not (0 <= r < cost_dist.shape[0] and 0 <= c < cost_dist.shape[1]):
             return []
         if cost_dist[r, c] == 0:
+            path.append((r, c))
             break
     return path[::-1]
 
@@ -509,21 +538,49 @@ def build_ecological_network(node_raster, core_raster,
     if skipped:
         print(f"跳过 {skipped} 条廊道（路径过短或穿过其他斑块）")
 
-    gdf_lines = gpd.GeoDataFrame(attr_lines, crs=dataset.GetProjection(), geometry=geom_lines)
+    out_crs = "EPSG:4326" if _get_pyproj_transformer(dataset.GetProjection()) is not None else dataset.GetProjection()
+    gdf_lines = gpd.GeoDataFrame(attr_lines, crs=out_crs, geometry=geom_lines)
     if len(gdf_lines) > 0:
         gdf_lines['_wkb'] = gdf_lines.geometry.apply(lambda g: g.wkb)
         gdf_lines = gdf_lines.loc[
             gdf_lines.groupby('_wkb')['lineid'].idxmin()
         ].drop(columns='_wkb').reset_index(drop=True)
 
-    gdf_points = gpd.GeoDataFrame(attr_points, crs=dataset.GetProjection(), geometry=geom_points)
+    gdf_points = gpd.GeoDataFrame(attr_points, crs=out_crs, geometry=geom_points)
     if len(gdf_points) > 0:
         gdf_points['_wkb'] = gdf_points.geometry.apply(lambda g: g.wkb)
         gdf_points = gdf_points.loc[
             gdf_points.groupby('_wkb')['nodeid'].idxmin()
         ].drop(columns='_wkb').reset_index(drop=True)
 
-    return G, G_act, gdf_lines, gdf_points
+    G_act_final = nx.Graph()
+    if len(gdf_points) > 0:
+        wkb_to_nodeid = {}
+        for row in gdf_points.itertuples(index=False):
+            geom = getattr(row, 'geometry')
+            nodeid = int(getattr(row, 'nodeid'))
+            wkb_to_nodeid[geom.wkb] = nodeid
+            G_act_final.add_node(
+                nodeid,
+                lon=float(geom.x),
+                lat=float(geom.y),
+                sourceid=int(getattr(row, 'sourceid')),
+                type=str(getattr(row, 'type')),
+            )
+
+        if len(gdf_lines) > 0:
+            for row in gdf_lines.itertuples(index=False):
+                from_pt = Point(float(getattr(row, 'fromX')), float(getattr(row, 'fromY')))
+                to_pt = Point(float(getattr(row, 'toX')), float(getattr(row, 'toY')))
+                u = wkb_to_nodeid.get(from_pt.wkb)
+                v = wkb_to_nodeid.get(to_pt.wkb)
+                if u is None or v is None:
+                    continue
+                attrs = row._asdict()
+                attrs.pop('geometry', None)
+                G_act_final.add_edge(int(u), int(v), **attrs)
+
+    return G, G_act_final, gdf_lines, gdf_points
 
 if __name__ == '__main__':
     print("="*60)
