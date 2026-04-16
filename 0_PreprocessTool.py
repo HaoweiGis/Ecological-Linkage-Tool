@@ -24,34 +24,85 @@
 
 import numpy as np
 import os
-import rasterio
+import json
 import geopandas as gpd
-from rasterio.features import shapes, rasterize
+from osgeo import gdal, ogr, osr
 from shapely.geometry import shape, Polygon, MultiPolygon
 
-def rasterize_shapefile(gdf, transform, out_shape, output_file, crs):
-    """矢量数据栅格化"""
-    shapes_iter = ((geom, value) for geom, value in zip(gdf.geometry, gdf["SourceID"]))
-    rasterized = rasterize(
-        shapes_iter,
-        out_shape=out_shape,
-        transform=transform,
-        fill=0,
-        dtype='int32'
-    )
+def _read_raster(path):
+    ds = gdal.Open(path)
+    if ds is None:
+        raise FileNotFoundError(path)
+    band = ds.GetRasterBand(1)
+    arr = band.ReadAsArray().astype(np.int32, copy=False)
+    gt = ds.GetGeoTransform()
+    proj_wkt = ds.GetProjection()
+    nodata = band.GetNoDataValue()
+    xsize, ysize = ds.RasterXSize, ds.RasterYSize
+    return arr, gt, proj_wkt, nodata, xsize, ysize
 
-    with rasterio.open(
-        output_file, "w",
-        driver="GTiff",
-        height=out_shape[0],
-        width=out_shape[1],
-        count=1,
-        dtype="int32",
-        crs=crs,
-        transform=transform,
-        nodata=0
-    ) as dst:
-        dst.write(rasterized, 1)
+def _polygonize_mask(src_arr, gt, proj_wkt, nodata=None, target_value=1):
+    ysize, xsize = src_arr.shape
+    mem_driver = gdal.GetDriverByName('MEM')
+    src_ds = mem_driver.Create('', xsize, ysize, 1, gdal.GDT_Int32)
+    src_ds.SetGeoTransform(gt)
+    src_ds.SetProjection(proj_wkt)
+    src_band = src_ds.GetRasterBand(1)
+    src_band.WriteArray(src_arr)
+    if nodata is not None:
+        src_band.SetNoDataValue(nodata)
+
+    mask_ds = mem_driver.Create('', xsize, ysize, 1, gdal.GDT_Byte)
+    mask_ds.SetGeoTransform(gt)
+    mask_ds.SetProjection(proj_wkt)
+    mask_band = mask_ds.GetRasterBand(1)
+    mask_band.WriteArray((src_arr == int(target_value)).astype(np.uint8, copy=False))
+
+    mem_vec_driver = ogr.GetDriverByName('Memory')
+    vec_ds = mem_vec_driver.CreateDataSource('mem')
+    srs = None
+    if proj_wkt:
+        srs = osr.SpatialReference()
+        srs.ImportFromWkt(proj_wkt)
+    layer = vec_ds.CreateLayer('polys', srs=srs)
+    layer.CreateField(ogr.FieldDefn('value', ogr.OFTInteger))
+
+    gdal.Polygonize(src_band, mask_band, layer, 0, options=[])
+
+    geoms = []
+    for feat in layer:
+        geom_ref = feat.GetGeometryRef()
+        if geom_ref is None:
+            continue
+        geom_json = geom_ref.ExportToJson()
+        geoms.append(shape(json.loads(geom_json)))
+    return geoms
+
+def _rasterize_shp_to_tif(shp_path, out_tif_path, xsize, ysize, gt, proj_wkt, burn_field):
+    drv = gdal.GetDriverByName('GTiff')
+    out_ds = drv.Create(
+        out_tif_path,
+        xsize,
+        ysize,
+        1,
+        gdal.GDT_Int32,
+        options=["TILED=YES", "COMPRESS=LZW"],
+    )
+    out_ds.SetGeoTransform(gt)
+    out_ds.SetProjection(proj_wkt)
+    out_band = out_ds.GetRasterBand(1)
+    out_band.SetNoDataValue(0)
+    out_band.Fill(0)
+
+    vec_ds = ogr.Open(shp_path)
+    if vec_ds is None:
+        raise FileNotFoundError(shp_path)
+    layer = vec_ds.GetLayer()
+    gdal.RasterizeLayer(out_ds, [1], layer, options=[f"ATTRIBUTE={burn_field}"])
+
+    out_band.FlushCache()
+    del vec_ds
+    del out_ds
 
 def fill_holes_within_polygons(geometry, all_geometries, min_area):
     """
@@ -89,7 +140,7 @@ def main():
     print("生态源地预处理工具")
     print("="*60)
     
-    base_dir = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     input_dir = os.path.join(base_dir, 'InputData')
     output_dir = os.path.join(base_dir, 'OutputData')
     
@@ -112,24 +163,19 @@ def main():
     
     # 加载栅格数据
     print("\n[1/4] 读取栅格数据...")
-    with rasterio.open(raster_path) as src:
-        raster_data = src.read(1).astype("int32")
-        transform = src.transform
-        crs = src.crs
+    raster_data, gt, proj_wkt, nodata, xsize, ysize = _read_raster(raster_path)
     
     print(f"  ✓ 栅格尺寸: {raster_data.shape}")
     print(f"  ✓ 唯一值: {np.unique(raster_data)}")
     
     # 栅格转矢量
     print("\n[2/4] 栅格转矢量面...")
-    mask = raster_data == 1
-    shapes_gen = shapes(raster_data, mask=mask, transform=transform)
-    
-    polygons = [shape(geom) for geom, value in shapes_gen]
-    gdf = gpd.GeoDataFrame(geometry=polygons, crs=crs)
+    polygons = _polygonize_mask(raster_data, gt, proj_wkt, nodata=nodata, target_value=1)
+    gdf = gpd.GeoDataFrame(geometry=polygons, crs=proj_wkt if proj_wkt else None)
     
     # 坐标系检查与转换
-    if not gdf.crs.is_projected:
+    original_crs = gdf.crs
+    if gdf.crs is not None and not gdf.crs.is_projected:
         print("  ⚠ 坐标系未投影，转换到EPSG:3857...")
         gdf = gdf.to_crs("EPSG:3857")
     
@@ -167,16 +213,22 @@ def main():
     print("\n保存矢量文件...")
     gdf.to_file(polySHPPath)
     print(f"  ✓ 面文件: {polySHPPath}")
-    
-    centroids.to_file(pointSHPPath)
+
+    if original_crs is not None and gdf.crs != original_crs:
+        gdf_orig = gdf.to_crs(original_crs)
+    else:
+        gdf_orig = gdf
+    centroids_orig = gdf_orig.copy()
+    centroids_orig.geometry = gdf_orig.geometry.centroid
+    centroids_orig.to_file(pointSHPPath)
     print(f"  ✓ 点文件: {pointSHPPath}")
     
     # 栅格化矢量数据
     print("\n栅格化矢量数据...")
-    rasterize_shapefile(gdf, transform, raster_data.shape, polyPath, crs)
+    _rasterize_shp_to_tif(polySHPPath, polyPath, xsize, ysize, gt, proj_wkt, "SourceID")
     print(f"  ✓ 面栅格: {polyPath}")
-    
-    rasterize_shapefile(centroids, transform, raster_data.shape, pointPath, crs)
+
+    _rasterize_shp_to_tif(pointSHPPath, pointPath, xsize, ysize, gt, proj_wkt, "SourceID")
     print(f"  ✓ 点栅格: {pointPath}")
     
     print("\n" + "="*60)

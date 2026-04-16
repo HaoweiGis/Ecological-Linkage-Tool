@@ -22,6 +22,9 @@ from shapely.geometry import LineString, Point
 import pandas as pd
 import heapq
 import os
+import sys
+import glob
+import sqlite3
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 
@@ -31,6 +34,7 @@ _RESISTANCE_RASTER = None
 _CONNECTIVITY_RASTER = None
 _GT = None
 _PROJ_WKT = None
+_PROJ_READY = False
 
 
 def _init_worker(core_raster, resistance_raster, connectivity_raster, gt, proj_wkt):
@@ -43,7 +47,58 @@ def _init_worker(core_raster, resistance_raster, connectivity_raster, gt, proj_w
     _GT = gt
     _PROJ_WKT = proj_wkt
 
+def _proj_db_compatible(proj_db_path):
+    try:
+        con = sqlite3.connect(proj_db_path)
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(projected_crs)")
+        projected_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA table_info(geodetic_crs)")
+        geodetic_cols = {row[1] for row in cur.fetchall()}
+        con.close()
+        return ('area_of_use_auth_name' in projected_cols) and ('area_of_use_auth_name' in geodetic_cols)
+    except Exception:
+        return False
+
+def _ensure_proj_db():
+    global _PROJ_READY
+    if _PROJ_READY:
+        return
+
+    cand_dirs = []
+    env_proj_lib = os.environ.get('PROJ_LIB') or ''
+    for part in env_proj_lib.split(';'):
+        part = part.strip()
+        if part:
+            cand_dirs.append(part)
+
+    conda_prefix = os.environ.get('CONDA_PREFIX') or ''
+    if conda_prefix:
+        cand_dirs.append(os.path.join(conda_prefix, 'Library', 'share', 'proj'))
+
+    for prefix in {sys.prefix, getattr(sys, 'base_prefix', ''), getattr(sys, 'real_prefix', '')}:
+        if prefix:
+            cand_dirs.append(os.path.join(prefix, 'Library', 'share', 'proj'))
+
+    for root in {os.path.join(os.path.dirname(sys.prefix), 'pkgs'), os.path.join(sys.prefix, 'pkgs'), r'C:\ProgramData\Anaconda3\pkgs'}:
+        if root and os.path.isdir(root):
+            for db_path in glob.glob(os.path.join(root, 'proj-*', 'Library', 'share', 'proj', 'proj.db')):
+                cand_dirs.append(os.path.dirname(db_path))
+
+    chosen = None
+    for d in cand_dirs:
+        db = os.path.join(d, 'proj.db')
+        if os.path.exists(db) and _proj_db_compatible(db):
+            chosen = d
+            break
+
+    if chosen:
+        os.environ['PROJ_LIB'] = chosen
+        osr.SetPROJSearchPaths([chosen])
+        _PROJ_READY = True
+
 def _get_transformer(src_wkt):
+    _ensure_proj_db()
     if src_wkt not in _transformer_cache:
         src = osr.SpatialReference()
         src.ImportFromWkt(src_wkt)
@@ -56,16 +111,12 @@ def pixel_to_geo(dataset, col, row):
     gt = dataset.GetGeoTransform()
     px = gt[0] + col * gt[1] + row * gt[2]
     py = gt[3] + col * gt[4] + row * gt[5]
-    transformer = _get_transformer(dataset.GetProjection())
-    lat, lon, _ = transformer.TransformPoint(px, py)
-    return lon, lat
+    return px, py
 
 def pixel_to_geo_by_gt(gt, proj_wkt, col, row):
     px = gt[0] + col * gt[1] + row * gt[2]
     py = gt[3] + col * gt[4] + row * gt[5]
-    transformer = _get_transformer(proj_wkt)
-    lat, lon, _ = transformer.TransformPoint(px, py)
-    return lon, lat
+    return px, py
 
 def GeoImgR(filename):
     dataset = gdal.Open(filename)
@@ -458,14 +509,14 @@ def build_ecological_network(node_raster, core_raster,
     if skipped:
         print(f"跳过 {skipped} 条廊道（路径过短或穿过其他斑块）")
 
-    gdf_lines = gpd.GeoDataFrame(attr_lines, crs="EPSG:4326", geometry=geom_lines)
+    gdf_lines = gpd.GeoDataFrame(attr_lines, crs=dataset.GetProjection(), geometry=geom_lines)
     if len(gdf_lines) > 0:
         gdf_lines['_wkb'] = gdf_lines.geometry.apply(lambda g: g.wkb)
         gdf_lines = gdf_lines.loc[
             gdf_lines.groupby('_wkb')['lineid'].idxmin()
         ].drop(columns='_wkb').reset_index(drop=True)
 
-    gdf_points = gpd.GeoDataFrame(attr_points, crs="EPSG:4326", geometry=geom_points)
+    gdf_points = gpd.GeoDataFrame(attr_points, crs=dataset.GetProjection(), geometry=geom_points)
     if len(gdf_points) > 0:
         gdf_points['_wkb'] = gdf_points.geometry.apply(lambda g: g.wkb)
         gdf_points = gdf_points.loc[
@@ -479,7 +530,7 @@ if __name__ == '__main__':
     print("生态廊道构建工具 - 最小累积阻力模型（并行版）")
     print("="*60)
 
-    base_dir   = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     input_dir  = os.path.join(base_dir, 'InputData')
     output_dir  = os.path.join(base_dir, 'OutputData')
     os.makedirs(output_dir, exist_ok=True)

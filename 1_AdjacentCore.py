@@ -73,7 +73,7 @@ def save_to_csv(adjacency_pairs, output_path):
 if __name__ == '__main__':
     import os
 
-    base_dir = r'D:\2_HaoweiPapers\1_SOCIAndEco\Ecological-Linkage-Tool-main'
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(base_dir, 'OutputData')
     os.makedirs(output_dir, exist_ok=True)
 
