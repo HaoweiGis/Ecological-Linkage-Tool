@@ -11,6 +11,14 @@ Ecological Linkage Tool (ELT): https://doi.org/10.5281/zenodo.19602332
 
 ELT comprises three key codes: 1_AdjacentCore.py, 2_GetActivateP.py, and 3_GetCorridorAN.py. 
 
+## Data Sample (InputData)
+
+The repository includes sample input data in `InputData/`:
+
+- `EcologicalSource.tif`: ecological source raster (binary source/background) used by preprocessing.
+- `ResistanceSurface.tif`: resistance raster used by MCR corridor construction.
+- `Connectivity.tif`: omnidirectional connectivity raster used for corridor weight attributes.
+
 ![image](https://github.com/HaoweiGis/Ecological-Linkage-Tool/blob/main/InputData/Framework.jpg)
 
 ##  OtherTools
